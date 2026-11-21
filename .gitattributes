@@ -1,0 +1,2 @@
+# keep the bytes exactly as they are: the patches contain CRLF lines (the .rc files), and autocrlf must not touch them
+* -text

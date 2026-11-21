@@ -1,0 +1,229 @@
+From e4031ced63c5172ee3b0a940ac6528d65d7da6d4 Mon Sep 17 00:00:00 2001
+From: np21w local patches <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 16:16:29 +0900
+Subject: [PATCH 2/3] Treat AX keyboard (type 7) like 101 when auto-detecting
+
+From np21w-rev107-key101.diff (win9x/np2.cpp, win9x/winkbd.cpp).
+---
+ win9x/np2.cpp    |   4 +-
+ win9x/winkbd.cpp | 155 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 156 insertions(+), 3 deletions(-)
+
+diff --git a/win9x/np2.cpp b/win9x/np2.cpp
+index 687ab16..8401c98 100644
+--- a/win9x/np2.cpp
++++ b/win9x/np2.cpp
+@@ -4121,7 +4121,7 @@ void loadNP2INI(const OEMCHAR *fname){
+ 			np2oscfg.KEYBOARD = KEY_PC98;
+ 			xrollkey = !xrollkey;
+ 		}
+-		else if (!keytype) {
++		else if ((!keytype) || ((GetKeyboardType(0) == 7) && (keytype == 1))) {	// 101 or AX
+ 			np2oscfg.KEYBOARD = KEY_KEY101;
+ 		}
+ 		else {
+@@ -4537,7 +4537,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
+ 			np2oscfg.KEYBOARD = KEY_PC98;
+ 			xrollkey = !xrollkey;
+ 		}
+-		else if (!keytype) {
++		else if ((!keytype) || ((GetKeyboardType(0) == 7) && (keytype == 1))) {	// 101 or AX
+ 			np2oscfg.KEYBOARD = KEY_KEY101;
+ 		}
+ 		else {
+diff --git a/win9x/winkbd.cpp b/win9x/winkbd.cpp
+index fa6bd96..4aefad5 100644
+--- a/win9x/winkbd.cpp
++++ b/win9x/winkbd.cpp
+@@ -2,6 +2,7 @@
+ #include	"np2.h"
+ #include	"winkbd.h"
+ #include	"keystat.h"
++#include	"pccore.h"
+ #include	"np2mt.h"
+ 
+ 
+@@ -178,12 +179,160 @@ static UINT8 winkbd_scancode_fallback(WPARAM wParam, LPARAM lParam, BOOL *shift)
+ }
+ 
+ 
++// ---- 101キーボード(US配列)対応
++
++// US配列の記号キーを、刻印どおりの文字になるPC-98のキーとシフト状態に変換する
++// Windowsのキーボードレイアウトに依存しないよう、仮想キーではなくscancodeで判定する
++#define	K101_SHIFT		0x80			// PC-98側でシフトを押した状態で送る
++
++typedef struct {
++	UINT8	scancode;
++	UINT8	key[2];						// [0]:シフトなし [1]:シフトあり
++	UINT8	jis;						// カナロック時(JIS配列の位置どおり)
++} KEY101TBL;
++
++static const KEY101TBL key101tbl[] = {
++	{0x03, {0x02,              0x1a},              0x02},	// 2 @
++	{0x07, {0x06,              0x0c},              0x06},	// 6 ^
++	{0x08, {0x07,              0x06 | K101_SHIFT}, 0x07},	// 7 &
++	{0x09, {0x08,              0x27 | K101_SHIFT}, 0x08},	// 8 *
++	{0x0a, {0x09,              0x08 | K101_SHIFT}, 0x09},	// 9 (
++	{0x0b, {0x0a,              0x09 | K101_SHIFT}, 0x0a},	// 0 )
++	{0x0c, {0x0b,              0x33 | K101_SHIFT}, 0x0b},	// - _
++	{0x0d, {0x0b | K101_SHIFT, 0x26 | K101_SHIFT}, 0x0c},	// = +
++	{0x1a, {0x1b,              0x1b | K101_SHIFT}, 0x1a},	// [ {
++	{0x1b, {0x28,              0x28 | K101_SHIFT}, 0x1b},	// ] }
++	{0x27, {0x26,              0x27},              0x26},	// ; :
++	{0x28, {0x07 | K101_SHIFT, 0x02 | K101_SHIFT}, 0x27},	// ' "
++	{0x29, {0x0c | K101_SHIFT, 0x1a | K101_SHIFT}, NC},		// ` ~
++	{0x2b, {0x0d,              0x0d | K101_SHIFT}, 0x28},	// \ |
++	{0x33, {0x30,              0x30 | K101_SHIFT}, 0x30},	// , <
++	{0x34, {0x31,              0x31 | K101_SHIFT}, 0x31},	// . >
++	{0x35, {0x32,              0x32 | K101_SHIFT}, 0x32},	// / ?
++};
++
++static UINT8	key101down[0x80];		// scancode毎に送出中のPC-98キー(0=なし)
++static BOOL		key101shift;			// PC-98側のシフトを実際の状態から変えている
++
++static const KEY101TBL *key101_search(UINT scancode) {
++
++	UINT	i;
++
++	for (i=0; i<NELEMENTS(key101tbl); i++) {
++		if (key101tbl[i].scancode == scancode) {
++			return(key101tbl + i);
++		}
++	}
++	return(NULL);
++}
++
++// PC-98側のシフトを実際のシフトキーの状態に戻す
++static void key101_syncshift(void) {
++
++	BOOL	l;
++	BOOL	r;
++
++	key101shift = FALSE;
++	l = (GetKeyState(VK_LSHIFT) & 0x8000) ? TRUE : FALSE;
++	r = (GetKeyState(VK_RSHIFT) & 0x8000) ? TRUE : FALSE;
++	if ((!l) && (!r)) {
++		keystat_senddata(0x70 | 0x80);
++		keystat_senddata(0x7d | 0x80);
++	}
++	else {
++		if (l) {
++			keystat_senddata(0x70);
++		}
++		if (r) {
++			keystat_senddata(0x7d);
++		}
++	}
++}
++
++static BOOL key101_keydown(LPARAM lParam) {
++
++	UINT			scancode;
++const KEY101TBL		*p;
++	UINT8			key;
++	UINT			shift;
++
++	if ((np2oscfg.KEYBOARD != KEY_KEY101) || (lParam & 0x01000000)) {
++		return(FALSE);
++	}
++	scancode = (UINT)((lParam & 0x00ff0000) >> 16);
++	p = key101_search(scancode);
++	if (p == NULL) {
++		return(FALSE);
++	}
++	shift = (GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 0;
++	if (keystat.ref[0x72] != NKEYREF_NC) {
++		// カナロック中は位置どおり
++		if (p->jis == NC) {
++			return(FALSE);
++		}
++		key = p->jis;
++	}
++	else if (((GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU)) & 0x8000) ||
++			(np2cfg.XSHIFT & 1)) {
++		// CTRL/GRPH併用時・シフトのメカニカル処理時はシフトを操作しない
++		key = (UINT8)(p->key[shift] & 0x7f);
++	}
++	else {
++		key = p->key[shift];
++		if (((key & K101_SHIFT) ? 1 : 0) != shift) {
++			if (key & K101_SHIFT) {
++				keystat_senddata(0x70);
++			}
++			else {
++				keystat_senddata(0x70 | 0x80);
++				keystat_senddata(0x7d | 0x80);
++			}
++			key101shift = TRUE;
++		}
++		key &= 0x7f;
++	}
++	// オートリピート中にシフトが変わって送るキーが変わった
++	if ((key101down[scancode]) && ((key101down[scancode] & 0x7f) != key)) {
++		keystat_senddata((UINT8)((key101down[scancode] & 0x7f) | 0x80));
++	}
++	keystat_senddata(key);
++	key101down[scancode] = key | 0x80;
++	return(TRUE);
++}
++
++static BOOL key101_keyup(LPARAM lParam) {
++
++	UINT	scancode;
++
++	if (lParam & 0x01000000) {
++		return(FALSE);
++	}
++	scancode = (UINT)((lParam & 0x00ff0000) >> 16);
++	if ((scancode >= NELEMENTS(key101down)) || (!key101down[scancode])) {
++		return(FALSE);
++	}
++	keystat_senddata((UINT8)((key101down[scancode] & 0x7f) | 0x80));
++	key101down[scancode] = 0;
++	if (key101shift) {
++		key101_syncshift();
++	}
++	return(TRUE);
++}
++
++
+ void winkbd_keydown(WPARAM wParam, LPARAM lParam) {
+ 
+ 	UINT8	data;
+ 	BOOL	shiftfallback;
+ 	
+ 	np2_multithread_EnterCriticalSection();
++	if (key101_keydown(lParam)) {
++		np2_multithread_LeaveCriticalSection();
++		return;
++	}
++	if ((key101shift) && (wParam != VK_SHIFT)) {
++		key101_syncshift();
++	}
+ 	if (wParam == VK_SHIFT) {
+ 		UINT scancode = (lParam & 0x00ff0000) >> 16;
+ 		wParam = MapVirtualKey(scancode, MAPVK_VSC_TO_VK_EX);
+@@ -210,7 +359,7 @@ void winkbd_keydown(WPARAM wParam, LPARAM lParam) {
+ 			keystat_senddata(0x70);							// PC/AT only!
+ 			data = key106ext[wParam & 0xff];
+ 		}
+-		if ((np2oscfg.KEYBOARD == KEY_KEY106 && data == 0x79))
++		if ((np2oscfg.KEYBOARD != KEY_PC98) && data == 0x79)
+ 		{
+ 			// APPキー特例
+ 			keystat_senddataraw(data);
+@@ -229,6 +378,10 @@ void winkbd_keyup(WPARAM wParam, LPARAM lParam) {
+ 	BOOL	shiftfallback;
+ 	
+ 	np2_multithread_EnterCriticalSection();
++	if (key101_keyup(lParam)) {
++		np2_multithread_LeaveCriticalSection();
++		return;
++	}
+ 	if (wParam == VK_SHIFT) {
+ 		UINT scancode = (lParam & 0x00ff0000) >> 16;
+ 		wParam = MapVirtualKey(scancode, MAPVK_VSC_TO_VK_EX);
+-- 
+2.56.1.windows.1
+

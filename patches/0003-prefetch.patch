@@ -1,0 +1,330 @@
+From 847e9ea8a7bdfe98119ddda441f27acfcdd77fd3 Mon Sep 17 00:00:00 2001
+From: np21w local patches <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 16:16:29 +0900
+Subject: [PATCH 3/3] Emulate the 386/486 prefetch queue (Wizardry 7 DS.EXE
+ anti-debug)
+
+From np21w-rev107-prefetch.diff (i386c/ia32/cpu.c, cpu_mem.c, interface.h). Active only when CPU family <= 4 and paging is off.
+---
+ i386c/ia32/cpu.c       |   2 +
+ i386c/ia32/cpu_mem.c   | 193 ++++++++++++++++++++++++++++++++++++++---
+ i386c/ia32/interface.h |  38 ++++++--
+ 3 files changed, 212 insertions(+), 21 deletions(-)
+
+diff --git a/i386c/ia32/cpu.c b/i386c/ia32/cpu.c
+index 27f9e1b..d45d124 100644
+--- a/i386c/ia32/cpu.c
++++ b/i386c/ia32/cpu.c
+@@ -80,6 +80,7 @@ exec_1step(void)
+ 	UINT32 op;
+ 
+ 	CPU_PREV_EIP = CPU_EIP;
++	pfq_begin();
+ 	CPU_STATSAVE.cpu_inst = CPU_STATSAVE.cpu_inst_default;
+ 
+ #if defined(ENABLE_TRAP)
+@@ -283,6 +284,7 @@ exec_allstep(void)
+ 	do {
+ 
+ 		CPU_PREV_EIP = CPU_EIP;
++		pfq_begin();
+ 		CPU_STATSAVE.cpu_inst = CPU_STATSAVE.cpu_inst_default;
+ 
+ #if defined(ENABLE_TRAP)
+diff --git a/i386c/ia32/cpu_mem.c b/i386c/ia32/cpu_mem.c
+index db9a5eb..267ec67 100644
+--- a/i386c/ia32/cpu_mem.c
++++ b/i386c/ia32/cpu_mem.c
+@@ -380,6 +380,152 @@ exc:
+ }
+ 
+ 
++/*
++ * prefetch queue emulation
++ *
++ * i386/i486 execute instructions from the prefetch queue, so a write to code
++ * bytes that have already been prefetched does not take effect until the
++ * queue is flushed by a control transfer.  Some copy protections rely on
++ * this to detect single-stepping.  Emulated only when the CPU family is 4 or
++ * lower (Pentium and later detect such writes) and paging is disabled, so
++ * that linear and physical addresses are the same.
++ */
++#define	PFQ_SIZE	16
++
++UINT32 pfq_wstart;
++UINT32 pfq_wsize;
++UINT pfq_count;
++UINT32 pfq_fetchend;
++static UINT32 pfq_addr[PFQ_SIZE];
++static UINT8 pfq_data[PFQ_SIZE];
++static UINT16 pfq_cs;
++static UINT32 pfq_insnstart;
++
++void MEMCALL
++pfq_save(UINT32 addr, UINT len)
++{
++	UINT i, j;
++
++	for (i = 0; i < len; i++, addr++) {
++		if ((UINT32)(addr - pfq_wstart) >= pfq_wsize)
++			continue;
++		for (j = 0; j < pfq_count; j++) {
++			if (pfq_addr[j] == addr)
++				break;
++		}
++		if ((j < pfq_count) || (pfq_count >= PFQ_SIZE))
++			continue;
++		pfq_addr[pfq_count] = addr;
++		pfq_data[pfq_count] = (UINT8)cpu_memoryread(addr);
++		pfq_count++;
++	}
++}
++
++UINT32 MEMCALL
++pfq_overlay(UINT32 addr, UINT32 value, UINT len)
++{
++	UINT i, j;
++
++	for (i = 0; i < len; i++) {
++		for (j = 0; j < pfq_count; j++) {
++			if (pfq_addr[j] == addr + i) {
++				value &= ~((UINT32)0xff << (i * 8));
++				value |= (UINT32)pfq_data[j] << (i * 8);
++				break;
++			}
++		}
++	}
++	return value;
++}
++
++static UINT8
++pfq_peek(UINT32 addr)
++{
++	UINT j;
++
++	for (j = 0; j < pfq_count; j++) {
++		if (pfq_addr[j] == addr)
++			return pfq_data[j];
++	}
++	return (UINT8)cpu_memoryread(addr);
++}
++
++static BOOL
++pfq_isbranch(UINT32 addr)
++{
++	UINT n;
++	UINT8 op = 0;
++
++	for (n = 0; n < 15; n++) {
++		op = pfq_peek(addr++);
++		if ((op != 0x26) && (op != 0x2e) && (op != 0x36) && (op != 0x3e) &&
++		    (op != 0x64) && (op != 0x65) && (op != 0x66) && (op != 0x67) &&
++		    (op != 0xf0) && (op != 0xf2) && (op != 0xf3))
++			break;
++	}
++	if (((op >= 0x70) && (op <= 0x7f)) || ((op >= 0xe0) && (op <= 0xe3)) ||
++	    ((op >= 0xe8) && (op <= 0xeb)) || (op == 0x9a) ||
++	    (op == 0xc2) || (op == 0xc3) || ((op >= 0xca) && (op <= 0xcf)))
++		return TRUE;
++	if (op == 0x0f) {
++		op = pfq_peek(addr);
++		return ((op >= 0x80) && (op <= 0x8f));
++	}
++	if (op == 0xff) {
++		op = (pfq_peek(addr) >> 3) & 7;
++		return ((op >= 2) && (op <= 5));
++	}
++	return FALSE;
++}
++
++void
++pfq_begin(void)
++{
++	UINT32 addr;
++	UINT i, j;
++
++	if ((i386cpuid.cpu_family > 4) || CPU_STAT_PAGING) {
++		pfq_count = 0;
++		pfq_wsize = 0;
++		return;
++	}
++	addr = CPU_CS_DESC.u.seg.segbase + CPU_EIP;
++	if (pfq_count) {
++		if ((CPU_CS != pfq_cs) || (addr != pfq_fetchend) ||
++		    pfq_isbranch(pfq_insnstart)) {
++			pfq_count = 0;
++		} else {
++			/* drop the bytes that have been consumed */
++			for (i = j = 0; i < pfq_count; i++) {
++				if ((UINT32)(pfq_addr[i] - addr) < PFQ_SIZE) {
++					pfq_addr[j] = pfq_addr[i];
++					pfq_data[j] = pfq_data[i];
++					j++;
++				}
++			}
++			pfq_count = j;
++		}
++	}
++	pfq_cs = CPU_CS;
++	pfq_insnstart = addr;
++	pfq_fetchend = addr;
++	pfq_wstart = addr;
++	pfq_wsize = PFQ_SIZE;
++}
++
++#define	PFQ_FETCHED(addr, value, len) \
++do { \
++	if (pfq_wsize) { \
++		if ((addr) + (len) > pfq_fetchend) { \
++			pfq_fetchend = (addr) + (len); \
++		} \
++		if (pfq_count) { \
++			(value) = pfq_overlay((addr), (value), (len)); \
++		} \
++	} \
++} while (/*CONSTCOND*/ 0)
++
++
+ /*
+  * code fetch
+  */
+@@ -393,10 +539,16 @@ cpu_codefetch(UINT32 offset)
+ 	sdp = &CPU_CS_DESC;
+ 	addr = sdp->u.seg.segbase + offset;
+ 
+-	if (!CPU_STAT_PM)
+-		return cpu_memoryread_codefetch(addr);
+-	if (offset <= sdp->u.seg.limit)
+-		return cpu_lmemoryread_codefetch(addr, ucrw);
++	if (!CPU_STAT_PM) {
++		UINT32 value = cpu_memoryread_codefetch(addr);
++		PFQ_FETCHED(addr, value, 1);
++		return (PF_UINT8)value;
++	}
++	if (offset <= sdp->u.seg.limit) {
++		UINT32 value = cpu_lmemoryread_codefetch(addr, ucrw);
++		PFQ_FETCHED(addr, value, 1);
++		return (PF_UINT8)value;
++	}
+ 
+ 	EXCEPTION(GP_EXCEPTION, 0);
+ 	return 0;	/* compiler happy */
+@@ -412,10 +564,16 @@ cpu_codefetch_w(UINT32 offset)
+ 	sdp = &CPU_CS_DESC;
+ 	addr = sdp->u.seg.segbase + offset;
+ 
+-	if (!CPU_STAT_PM)
+-		return cpu_memoryread_w_codefetch(addr);
+-	if (offset <= sdp->u.seg.limit - 1)
+-		return cpu_lmemoryread_w_codefetch(addr, ucrw);
++	if (!CPU_STAT_PM) {
++		UINT32 value = cpu_memoryread_w_codefetch(addr);
++		PFQ_FETCHED(addr, value, 2);
++		return (PF_UINT16)value;
++	}
++	if (offset <= sdp->u.seg.limit - 1) {
++		UINT32 value = cpu_lmemoryread_w_codefetch(addr, ucrw);
++		PFQ_FETCHED(addr, value, 2);
++		return (PF_UINT16)value;
++	}
+ 
+ 	EXCEPTION(GP_EXCEPTION, 0);
+ 	return 0;	/* compiler happy */
+@@ -431,11 +589,17 @@ cpu_codefetch_d(UINT32 offset)
+ 	sdp = &CPU_CS_DESC;
+ 	addr = sdp->u.seg.segbase + offset;
+ 
+-	if (!CPU_STAT_PM)
+-		return cpu_memoryread_d_codefetch(addr);
++	if (!CPU_STAT_PM) {
++		UINT32 value = cpu_memoryread_d_codefetch(addr);
++		PFQ_FETCHED(addr, value, 4);
++		return (PF_UINT32)value;
++	}
+ 
+-	if (offset <= sdp->u.seg.limit - 3)
+-		return cpu_lmemoryread_d_codefetch(addr, ucrw);
++	if (offset <= sdp->u.seg.limit - 3) {
++		UINT32 value = cpu_lmemoryread_d_codefetch(addr, ucrw);
++		PFQ_FETCHED(addr, value, 4);
++		return (PF_UINT32)value;
++	}
+ 
+ 	EXCEPTION(GP_EXCEPTION, 0);
+ 	return 0;	/* compiler happy */
+@@ -455,9 +619,12 @@ cpu_opcodefetch(UINT32 offset)
+ 
+ 	if (!CPU_STAT_PM)
+ 	{
+-		return (opCache = cpu_memoryread_w_codefetch(addr)) & 0xff;
++		opcode = cpu_memoryread_w_codefetch(addr);
++		PFQ_FETCHED(addr, opcode, 2);
++		return (opCache = opcode) & 0xff;
+ 	}
+ 	opcode = cpu_lmemoryread_w_codefetch(addr, ucrw);
++	PFQ_FETCHED(addr, opcode, 2);
+ 	if (offset <= limit - 1)
+ 	{
+ 		// 2byteとも違反でない場合キャッシュする
+diff --git a/i386c/ia32/interface.h b/i386c/ia32/interface.h
+index 275fc65..00b64aa 100644
+--- a/i386c/ia32/interface.h
++++ b/i386c/ia32/interface.h
+@@ -58,13 +58,35 @@
+ #define	CPU_SETEXTSIZE(size)		ia32_setextsize((UINT32)(size) << 20)
+ #define CPU_SETEMM(frame, addr)		ia32_setemm(frame, addr)
+ 
++/* prefetch queue emulation (cpu_mem.c) */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern UINT32 pfq_wstart;
++extern UINT32 pfq_wsize;
++void MEMCALL pfq_save(UINT32 addr, UINT len);
++void pfq_begin(void);
++#ifdef __cplusplus
++}
++#endif
++
++STATIC_INLINE UINT32
++pfq_w(UINT32 addr, UINT len)
++{
++	if ((UINT32)(addr - pfq_wstart) < pfq_wsize) {
++		pfq_save(addr, len);
++	}
++	return addr;
++}
++
++
+  // USE_LEGACY_MEMORY_ACCESSがある場合は旧ルーチンを使用する
+ #if defined(USE_LEGACY_MEMORY_ACCESS)
+ // 旧版
+-#define	cpu_memorywrite(a,v)	memp_write8(a,v)
+-#define	cpu_memorywrite_b(a,v)	memp_write8(a,v)
+-#define	cpu_memorywrite_w(a,v)	memp_write16(a,v)
+-#define	cpu_memorywrite_d(a,v)	memp_write32(a,v)
++#define	cpu_memorywrite(a,v)	memp_write8(pfq_w(a,1),v)
++#define	cpu_memorywrite_b(a,v)	memp_write8(pfq_w(a,1),v)
++#define	cpu_memorywrite_w(a,v)	memp_write16(pfq_w(a,2),v)
++#define	cpu_memorywrite_d(a,v)	memp_write32(pfq_w(a,4),v)
+ #define	cpu_memoryread(a)	memp_read8(a)
+ #define	cpu_memoryread_b(a)	memp_read8(a)
+ #define	cpu_memoryread_w(a)	memp_read16(a)
+@@ -95,10 +117,10 @@
+ 
+ #else
+ // 高速版
+-#define	cpu_memorywrite(a,v)	memp_write8_fast(a,v)
+-#define	cpu_memorywrite_b(a,v)	memp_write8_fast(a,v)
+-#define	cpu_memorywrite_w(a,v)	memp_write16_fast(a,v)
+-#define	cpu_memorywrite_d(a,v)	memp_write32_fast(a,v)
++#define	cpu_memorywrite(a,v)	memp_write8_fast(pfq_w(a,1),v)
++#define	cpu_memorywrite_b(a,v)	memp_write8_fast(pfq_w(a,1),v)
++#define	cpu_memorywrite_w(a,v)	memp_write16_fast(pfq_w(a,2),v)
++#define	cpu_memorywrite_d(a,v)	memp_write32_fast(pfq_w(a,4),v)
+ #define	cpu_memoryread(a)	memp_read8_fast(a)
+ #define	cpu_memoryread_b(a)	memp_read8_fast(a)
+ #define	cpu_memoryread_w(a)	memp_read16_fast(a)
+-- 
+2.56.1.windows.1
+

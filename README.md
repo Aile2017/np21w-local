@@ -23,10 +23,6 @@ This repository holds only the patches and the build procedure.
    Use a 486-class CPU setting in the ini (`cpu_fami=4`, `cpu_mode=1`, `cpu_step=3`, `cpu_feat=1`, `cpu_brid=0`);
    with a Pentium-class setting it reboots in a loop, as it does on real hardware.
 
-`SUPPORT_NPDISP_W2K` is also switched off, but as a step of `build.ps1` and not as a patch
-(the `PreprocessorDefinitions` lines change between releases and the patch used to conflict).
-The Windows 2000 NPDISP is not needed for DOS use, and with the prefetch patch it caused tempo and UMB problems.
-
 ## Build
 
 Requirements: Visual Studio 2026 (v145 toolset), Git, PowerShell.
@@ -78,8 +74,5 @@ and keep the language DLLs (`out\language\*.dll`) in step with the executables.
    (`i386c/ia32/cpu.c`、`cpu_mem.c`、`interface.h`)。CPU ファミリが 4 以下で、
    ページングが無効のときだけ働きます。プリフェッチ済みのコードを書き換えて動作を判定する
    アンチデバッグ(Wizardry 7 PC-98 の `DS.EXE` など)が、再起動を繰り返す問題を避けるためのものです。
-
-ビルド手順の `SUPPORT_NPDISP_W2K` の無効化は、DOS 専用の用途では Windows 2000 用 NPDISP が不要で、
-有効のままだと `prefetch` との組み合わせで動作が不安定になる場合があったためです。
 
 運用の詳しい手順と落とし穴は、[NOTES.md](NOTES.md) にあります。

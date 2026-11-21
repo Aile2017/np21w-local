@@ -3,15 +3,15 @@
    1. read base.conf
    2. extract BASE_REF of the upstream repository into build\src
    3. apply patches\*.patch (git apply --ignore-whitespace: the .rc files are CRLF)
-   4. remove SUPPORT_NPDISP_W2K from PreprocessorDefinitions of the np21 project
-   5. build exe (np21 / np2, x64 / Win32) and the language DLLs
-   6. collect them under out\
+   4. build exe (np21 / np2, x64 / Win32) and the language DLLs
+   5. collect them under out\
  Nothing outside this repository is touched; copy out\ into the bin directory yourself.
 #>
 param(
     [string]$MSBuild = 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe',
     [switch]$SkipLanguage,
-    [switch]$ExeOnlyX64        # np21x64w.exe only (quick build)
+    [switch]$ExeOnlyX64,       # np21x64w.exe only (quick build)
+    [string]$OutDir = 'out'    # output directory under the repository root
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -48,16 +48,6 @@ try {
         git -c core.autocrlf=false apply --ignore-whitespace --unsafe-paths -p1 $p.FullName   # the system gitconfig may set autocrlf=true, which rewrites patched files to CRLF
         if ($LASTEXITCODE) { throw "patch failed: $($p.Name)" }
     }
-    # W2K npdisp is switched off (it is a script step, not a patch, so it does not conflict between versions)
-    $proj = "$src\win9x\np21vs2019.vcxproj"
-    $enc = New-Object System.Text.UTF8Encoding($true)
-    $lines = [IO.File]::ReadAllText($proj) -split "(?<=\n)"
-    $n = 0
-    $out = foreach ($l in $lines) {
-        if ($l -match '<PreprocessorDefinitions>' -and $l -match 'SUPPORT_NPDISP_W2K;') { $n++; $l -replace 'SUPPORT_NPDISP_W2K;', '' } else { $l }
-    }
-    [IO.File]::WriteAllText($proj, ($out -join ''), $enc)
-    Write-Host "SUPPORT_NPDISP_W2K removed from $n PreprocessorDefinitions"
 
     function Invoke-Build($projFile, $platform, $extra) {
         & $MSBuild $projFile "-p:Configuration=Release" "-p:Platform=$platform" -m -nodeReuse:false -nologo -v:m @extra | Where-Object { $_ -notmatch 'warning' }
@@ -79,7 +69,7 @@ try {
     }
 } finally { Pop-Location }
 
-$o = "$root\out"
+$o = "$root\$OutDir"
 if (Test-Path $o) { Remove-Item $o -Recurse -Force }
 New-Item -ItemType Directory "$o\language" | Out-Null
 foreach ($f in 'x64\Release\np21x64w.exe', 'Win32\Release\np21w.exe', 'x64\Release\np2x64w.exe', 'Win32\Release\np2w.exe') {

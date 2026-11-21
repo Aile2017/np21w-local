@@ -20,7 +20,7 @@
 |---|---|
 | `base.conf` | パッチを当てる公開元のリポジトリとコミット(`BASE_REF`) |
 | `patches\` | 個人パッチ 3 つ(`git format-patch` 形式。ファイル名の順に適用) |
-| `build.ps1` | ソースの取り出し、パッチ適用、W2K 無効化、ビルド、`out\` への収集 |
+| `build.ps1` | ソースの取り出し、パッチ適用、ビルド、`out\` への収集 |
 | `tools\update_np21w.py` | 新版のアーカイブを `np21w`(公開元のソース)に取り込むスクリプト(§4) |
 | `tools\import_np21w.py`、`tools\import-log.md`、`tools\import-run.out` | 過去の全アーカイブを一括で取り込んだスクリプトとそのログ(記録用。§6) |
 | `.gitattributes` | `* -text`。パッチに CRLF の行(`.rc` ファイル)が入っているので、改行変換を止めてある |
@@ -44,24 +44,18 @@
    `wiz67.ini` で 486 相当(`cpu_fami=4`、`cpu_mode=1`、`cpu_step=3`、`cpu_feat=1`、`cpu_brid=0`)にしておくこと。
    Pentium 相当では、実機と同じく再起動ループする。
 
-パッチではなく、`build.ps1` の手順として、`SUPPORT_NPDISP_W2K` を無効にする
-(`np21vs2019.vcxproj` の `PreprocessorDefinitions` から `SUPPORT_NPDISP_W2K;` を取り除く)。
+### W2K(`SUPPORT_NPDISP_W2K`)について
 
-- 以前はこれもパッチ(コミット)にしていたが、β9・β10 で `PreprocessorDefinitions` の行が変わり、衝突した。
-  版が変わっても壊れないよう、スクリプトの手順にした。
-- `np2vs2019.vcxproj` のほうは `UndefinePreprocessorDefinitions` に入っているだけで、触らない。
+W2K(Windows 2000 用 NPDISP)は、公開元のとおり**有効のままビルドする**。無効化する処理は、ない。
 
-### なぜ W2K を無効にするのか
-
-- rev107β3・β4 のプロジェクトには `UndefinePreprocessorDefinitions: SUPPORT_NPDISP_W2K` があり、W2K は無効だった。
-  β5 以降はこの指定が消えて、W2K(Windows 2000 用 NPDISP)が有効になっている。配布版の exe も有効。
-- この環境(DOS 専用)で `prefetch` を当てたビルドに W2K を有効のまま使うと、次の症状が出た。
-  - `SuperDepth.cmd`: テンポがおかしくなり、音切れが出る。
-  - `msdos5.cmd`: UMB を確保するデバイスドライバ(`UMB領域 : A5-A7 D0-D7 DE-DF E8-F3` の表示)で止まる。
-- `prefetch` なしの W2K 有効ビルド(配布版も同じ)では、これらは出なかった。
-  W2K 無効 + `prefetch` ではどれも出ず、`wiz7.cmd` も再起動しなかった。
-  W2K と `prefetch` の組み合わせで何が起きているかの原因は、特定していない。
-- W2K を無効にすると、ゲストの Windows 2000 で NPDISP を使えない。DOS だけなら影響はない。
+- 経緯: rev107β5 以降、W2K が有効になっている(β3・β4 のプロジェクトは `UndefinePreprocessorDefinitions` で無効だった)。
+  2026-11-15 に、`prefetch` を当てて W2K 有効でビルドしたところ、`SuperDepth.cmd` のテンポ・音切れと、
+  `msdos5.cmd` の UMB ドライバでの停止が出たため、いったん W2K を無効にする処理(パッチ、のちに `build.ps1` の手順)を入れた。
+- 2026-11-21 に、rev107β10 + 3 つのパッチを W2K 有効でビルドし直して試したところ、`msdos5.cmd`、
+  `SuperDepth.cmd`、`wiz7.cmd` のどれも問題が出なかった。以前の症状は、そのとき使ったバイナリの状態が
+  悪かっただけの可能性が高い(原因は特定していない)。そのため、無効化の処理は、すべて取り除いた。
+- また同じ症状が出たときは、まず `SUPPORT_NPDISP_W2K` を外して(`np21vs2019.vcxproj` の `PreprocessorDefinitions` から
+  `SUPPORT_NPDISP_W2K;` を取り除く)比べると、切り分けられる。
 
 ## 3. ビルド手順(Visual Studio 2026)
 
@@ -78,9 +72,8 @@ cd C:\usr\games\np21w\git\np21w-local
 1. `base.conf` を読む。`BASE_REPO`(ローカルの `np21w`)があればそれを、なければ `BASE_URL` を `build\` に clone して使う。
 2. `BASE_REF` のコミットを、`build\src` にローカル clone + checkout で取り出す。
 3. `patches\*.patch` を、`git -c core.autocrlf=false apply --ignore-whitespace --unsafe-paths -p1` で順に当てる。
-4. `SUPPORT_NPDISP_W2K` を無効にする(§2)。
-5. MSBuild で、次の構成と言語 DLL をビルドする。
-6. `out\` に集める。**`bin` には何も触らない。** 差し替えは手でコピーする。
+4. MSBuild で、次の構成と言語 DLL をビルドする。
+5. `out\` に集める。**`bin` には何も触らない。** 差し替えは手でコピーする。
 
 | 構成 | プロジェクト | Platform | 出力(`out\`) |
 |---|---|---|---|
